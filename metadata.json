@@ -1,0 +1,6 @@
+{
+  "name": "Xtream Link Extractor",
+  "description": "Extract streaming URLs from an Xtream API source",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
