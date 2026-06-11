@@ -9,7 +9,6 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Increase payload limit because M3U bodies can be large if we pass them
   app.use(express.json({ limit: '50mb' }));
 
   app.post("/api/parse-m3u", async (req, res) => {
@@ -37,12 +36,9 @@ async function startServer() {
     }
   });
 
-  // Proxy route for Xtream API to avoid CORS issues in the browser
   app.post("/api/xtream", async (req, res) => {
     try {
       let { server, username, password, action, category_id } = req.body;
-      
-      // Fix potential typo from user input like http://...http://...
       let baseUrl = server.trim();
       const dupMatch = baseUrl.match(/^(https?:\/\/[^/]+)\1$/);
       if (dupMatch) {
@@ -65,7 +61,6 @@ async function startServer() {
       }
 
       const response = await fetch(url.toString(), {
-        // Some servers reject fetch default user-agent
         headers: {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
         }
@@ -84,7 +79,6 @@ async function startServer() {
     }
   });
 
-  // Proxy route for direct media downloads
   app.get("/api/download", async (req, res) => {
     try {
       const targetUrl = req.query.url as string;
@@ -162,7 +156,6 @@ async function startServer() {
             return followRedirect(location, depth + 1);
           }
 
-          // Evaluate the current resolved final destination url and headers, NOT the initial input query
           const finalUrlLower = url.toLowerCase();
           const contentTypeLower = (proxyRes.headers['content-type'] || '').toLowerCase();
 
@@ -170,13 +163,16 @@ async function startServer() {
                         contentTypeLower.includes('mpegurl') ||
                         contentTypeLower.includes('x-mpegurl');
 
-          // Forward headers
+          // Whitelist only completely safe native streaming transmission headers
+          const cleanSafeHeaders = ['content-type', 'accept-ranges', 'content-range', 'cache-control'];
           const headersToForward: Record<string, string | string[]> = {};
+          
           for (const [key, value] of Object.entries(proxyRes.headers)) {
-              if (value && key.toLowerCase() !== 'access-control-allow-origin' && key.toLowerCase() !== 'host') {
+              if (value && cleanSafeHeaders.includes(key.toLowerCase())) {
                   headersToForward[key] = value;
               }
           }
+          
           headersToForward['access-control-allow-origin'] = '*';
           if (!headersToForward['content-type']) {
               headersToForward['content-type'] = isM3u8 ? 'application/x-mpegURL' : 'video/mp2t';
@@ -201,7 +197,6 @@ async function startServer() {
                     return line;
                   }
                 }
-                // Handle URI in tags like #EXT-X-KEY:METHOD=AES-128,URI="http://..."
                 if (trimmed.startsWith('#EXT-X-KEY:') || trimmed.startsWith('#EXT-X-MAP:')) {
                   return trimmed.replace(/URI="([^"]+)"/, (match, uri) => {
                      try {
@@ -223,11 +218,11 @@ async function startServer() {
               res.end(rewritten);
             });
           } else {
-            // CRITICAL FAIL-FAST CHECK: If the client asked for a playlist (.m3u8) but 
-            // the server redirected us to an infinite raw video stream, send a 415 error code.
-            // This crashes hls.js instantly, triggering the frontend to hop cleanly onto the mpegts player fallback.
+            // INSTANT FAIL-FAST SEQUENCE: If the query URL thinks it's a playlist (.m3u8 text file) 
+            // but the destination proxy resolution yields raw binary data chunks, drop connection with a 415 error.
+            // This crashes hls.js immediately, dropping the player down into the clean mpegts fallback cascade.
             if (streamUrl.toLowerCase().includes('.m3u8')) {
-              res.status(415).send('Expected M3U8 text manifest but received binary stream. Forcing player fallback sequence.');
+              res.status(415).send('Proxy intercepted binary video stream disguised as text manifest.');
               return;
             }
 
@@ -258,7 +253,6 @@ async function startServer() {
     followRedirect(streamUrl, 0);
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
