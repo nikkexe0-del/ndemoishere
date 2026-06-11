@@ -145,10 +145,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
     const kind = detectKind(url);
     const proxiedUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
 
-    // Generate fallback TS variants if dealing with an Xtream live m3u8 stream
+    // FIX: Generate fallback TS variants accurately by maintaining the /live/ routing block
     let fallbackTsUrl = "";
     if (url.includes('/live/') && url.includes('.m3u8')) {
-      fallbackTsUrl = url.replace('/live/', '/').replace('.m3u8', '');
+      fallbackTsUrl = url.replace('.m3u8', '');
     }
 
     type LoadAttempt = {
