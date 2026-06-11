@@ -13,7 +13,7 @@ interface VideoPlayerProps {
   hasPrev?: boolean;
 }
 
-type StreamKind = 'hls' | 'mpegts' | 'native';
+type StreamKind = 'hls' | 'mpegts';
 
 interface LoadAttempt {
   url: string;
@@ -135,55 +135,33 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
     setLoading(true);
     setBuffering(false);
 
-    // Build absolute tank-proof cascade list of streaming strategies
+    // Build the fallback strategies list using the proxy stream switcher parameters
     const attempts: LoadAttempt[] = [];
-    const proxiedOriginalUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+    const encodedUrl = encodeURIComponent(url);
 
-    // 1. Try default layout (HLS proxy)
+    // Strategy 1: Treat as standard HLS playlist wrapper
     attempts.push({ 
-      url: proxiedOriginalUrl, 
+      url: `/api/proxy?url=${encodedUrl}`, 
       forceKind: 'hls', 
       disableAudio: false, 
-      label: 'HLS Live Proxy Link' 
+      label: 'Standard HLS Playback Mode' 
     });
 
-    // Extract paths for TS fallbacks if dealing with an m3u8 playlist wrapper
-    if (url.toLowerCase().includes('.m3u8')) {
-      const tsUrl = url.replace(/\.m3u8/i, '.ts');
-      const cleanUrl = url.replace(/\.m3u8/i, '');
+    // Strategy 2: Direct Binary Stream Fallback (Forces proxy to bypass text accumulations)
+    attempts.push({ 
+      url: `/api/proxy?url=${encodedUrl}&type=binary`, 
+      forceKind: 'mpegts', 
+      disableAudio: false, 
+      label: 'MPEG-TS Native Binary Mode' 
+    });
 
-      // 2. Try raw .ts route via proxy with Audio
-      attempts.push({ 
-        url: `/api/proxy?url=${encodeURIComponent(tsUrl)}`, 
-        forceKind: 'mpegts', 
-        disableAudio: false, 
-        label: 'MPEG-TS Standard Stream' 
-      });
-
-      // 3. Try raw .ts route via proxy WITHOUT Audio (Bypasses corrupted panels syncing freeze loops)
-      attempts.push({ 
-        url: `/api/proxy?url=${encodeURIComponent(tsUrl)}`, 
-        forceKind: 'mpegts', 
-        disableAudio: true, 
-        label: 'MPEG-TS Video Only Bypass Mode' 
-      });
-
-      // 4. Try extensionless directory structure with Audio
-      attempts.push({ 
-        url: `/api/proxy?url=${encodeURIComponent(cleanUrl)}`, 
-        forceKind: 'mpegts', 
-        disableAudio: false, 
-        label: 'Direct Panel Routing Stream' 
-      });
-      
-      // 5. Try extensionless directory structure WITHOUT Audio
-      attempts.push({ 
-        url: `/api/proxy?url=${encodeURIComponent(cleanUrl)}`, 
-        forceKind: 'mpegts', 
-        disableAudio: true, 
-        label: 'Direct Panel Video Only Bypass Mode' 
-      });
-    }
+    // Strategy 3: Direct Binary Stream Fallback WITHOUT Audio (Bypasses stream sync freezes)
+    attempts.push({ 
+      url: `/api/proxy?url=${encodedUrl}&type=binary`, 
+      forceKind: 'mpegts', 
+      disableAudio: true, 
+      label: 'MPEG-TS Video-Only Recovery Mode' 
+    });
 
     const clearWatchdog = () => {
       if (watchdogTimeout) {
@@ -197,7 +175,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
       clearWatchdog();
 
       if (attemptIndex >= attempts.length) {
-        setError(`This stream could not be loaded. This happens when the source broadcaster channel is down or offline.`);
+        setError(`This live channel stream is currently unavailable or offline.`);
         setLoading(false);
         setBuffering(false);
         if (onPlaybackFailed) onPlaybackFailed();
@@ -212,7 +190,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
       console.log(`VideoPlayer: ${logMsg}`);
       setErrorLogs(prev => [...prev, logMsg]);
 
-      // Complete cleanup of active player libraries
+      // Complete cleanup of existing active pipelines
       if (currentMpegtsPlayer) {
         try {
           currentMpegtsPlayer.unload();
@@ -230,7 +208,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
         hlsRef.current = null;
       }
 
-      // CRITICAL FLUSH: Explicitly strip, pause, and completely reset browser media state strings
+      // Hard reset for the internal browser media pipeline
       try {
         video.pause();
         video.src = '';
@@ -241,13 +219,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
       setLoading(true);
       setBuffering(false);
 
-      // ARM WATCHDOG TIMER: If video fails to output frames within 6 seconds, force-advance state loop
+      // Watchdog Timer: Force strategy rotation if no video packets clear within 5 seconds
       watchdogTimeout = setTimeout(() => {
         if (!active) return;
-        console.warn(`Watchdog triggered: Strategy ${attemptIndex + 1} stalled on buffering. Advancing to next strategy...`);
-        setErrorLogs(prev => [...prev, `⚠️ Strategy ${attemptIndex + 1} connection timed out`]);
+        console.warn(`Watchdog timed out on strategy ${attemptIndex + 1}. Transitioning to next strategy...`);
+        setErrorLogs(prev => [...prev, `⚠️ Strategy ${attemptIndex + 1} response threshold exceeded`]);
         tryLoad(attemptIndex + 1);
-      }, 6000);
+      }, 5000);
 
       if (activeKind === 'hls') {
         if (Hls.isSupported()) {
@@ -273,25 +251,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
             if (!active) return;
             if (data.fatal) {
               clearWatchdog();
-              setTimeout(() => tryLoad(attemptIndex + 1), 20);
+              setTimeout(() => tryLoad(attemptIndex + 1), 16);
             }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           video.src = activeUrl;
-          
-          const onLoadedMetadata = () => {
-            if (!active) return;
-            video.play().catch(() => {});
-          };
-
+          const onLoadedMetadata = () => { if (active) video.play().catch(() => {}); };
           const onNativeError = () => {
             if (!active) return;
             clearWatchdog();
             video.removeEventListener('loadedmetadata', onLoadedMetadata);
             video.removeEventListener('error', onNativeError);
-            setTimeout(() => tryLoad(attemptIndex + 1), 20);
+            setTimeout(() => tryLoad(attemptIndex + 1), 16);
           };
-
           video.addEventListener('loadedmetadata', onLoadedMetadata);
           video.addEventListener('error', onNativeError);
         } else {
@@ -310,22 +282,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
               enableWorker: false,
               lazyLoad: false,
               liveBufferLatencyChasing: true,
-              liveBufferLatencyMaxLatency: 2.5,
-              liveBufferLatencyMinRemaining: 0.8,
-              stashInitialSize: 32, // Tiny buffer size ensures ultra fast startup times
+              liveBufferLatencyMaxLatency: 3.0,
+              liveBufferLatencyMinRemaining: 1.0,
+              stashInitialSize: 64, 
             });
             
             currentMpegtsPlayer = player;
             playerRef.current = player;
             player.attachMediaElement(video);
             player.load();
-            
             player.play().catch(() => {});
             
             player.on(mpegts.Events.ERROR, () => {
               if (!active) return;
               clearWatchdog();
-              setTimeout(() => tryLoad(attemptIndex + 1), 20);
+              setTimeout(() => tryLoad(attemptIndex + 1), 16);
             });
           } catch (err) {
             clearWatchdog();
@@ -338,16 +309,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
       }
     };
 
-    // Initialize pipeline cascade
+    // Trigger pipeline processing layout
     tryLoad(0);
 
-    const handleWaiting = () => {
-      if (active) setBuffering(true);
-    };
-    
+    const handleWaiting = () => { if (active) setBuffering(true); };
     const handlePlaying = () => {
       if (!active) return;
-      clearWatchdog(); // Kill watchdog loop completely once video outputs active frames
+      clearWatchdog(); 
       setBuffering(false);
       setLoading(false);
     };
@@ -360,9 +328,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
       clearWatchdog();
       video.removeEventListener('waiting', handleWaiting);
       video.removeEventListener('playing', handlePlaying);
-      if (currentHls) {
-        try { currentHls.destroy(); } catch (e) {}
-      }
+      if (currentHls) { try { currentHls.destroy(); } catch (e) {} }
       if (currentMpegtsPlayer) {
         try {
           currentMpegtsPlayer.unload();
