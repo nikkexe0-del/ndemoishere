@@ -119,6 +119,8 @@ async function startServer() {
   // Proxy route for streaming to avoid CORS/mixed-content
   app.get('/api/proxy', (req, res) => {
     const streamUrl = req.query.url as string;
+    const forceBinary = req.query.type === 'binary'; // SNIFF THE FORCE SWITCH
+
     if (!streamUrl) {
       return res.status(400).send('URL is required');
     }
@@ -159,20 +161,20 @@ async function startServer() {
           const finalUrlLower = url.toLowerCase();
           const contentTypeLower = (proxyRes.headers['content-type'] || '').toLowerCase();
 
-          const isM3u8 = finalUrlLower.includes('.m3u8') || 
-                        contentTypeLower.includes('mpegurl') ||
-                        contentTypeLower.includes('x-mpegurl');
+          // If binary mode is forced, skip the M3U8 string parser entirely
+          const isM3u8 = !forceBinary && (
+            finalUrlLower.includes('.m3u8') || 
+            contentTypeLower.includes('mpegurl') ||
+            contentTypeLower.includes('x-mpegurl')
+          );
 
-          // Whitelist only completely safe native streaming transmission headers
-          const cleanSafeHeaders = ['content-type', 'accept-ranges', 'content-range', 'cache-control'];
+          // Forward ALL headers to guarantee chunked streaming flags survive
           const headersToForward: Record<string, string | string[]> = {};
-          
           for (const [key, value] of Object.entries(proxyRes.headers)) {
-              if (value && cleanSafeHeaders.includes(key.toLowerCase())) {
+              if (value && key.toLowerCase() !== 'access-control-allow-origin' && key.toLowerCase() !== 'host') {
                   headersToForward[key] = value;
               }
           }
-          
           headersToForward['access-control-allow-origin'] = '*';
           if (!headersToForward['content-type']) {
               headersToForward['content-type'] = isM3u8 ? 'application/x-mpegURL' : 'video/mp2t';
@@ -218,11 +220,10 @@ async function startServer() {
               res.end(rewritten);
             });
           } else {
-            // INSTANT FAIL-FAST SEQUENCE: If the query URL thinks it's a playlist (.m3u8 text file) 
-            // but the destination proxy resolution yields raw binary data chunks, drop connection with a 415 error.
-            // This crashes hls.js immediately, dropping the player down into the clean mpegts fallback cascade.
-            if (streamUrl.toLowerCase().includes('.m3u8')) {
-              res.status(415).send('Proxy intercepted binary video stream disguised as text manifest.');
+            // FAIL-FAST INTERCEPT: If standard player mode requested an M3U8 string but got a binary redirect, 
+            // trigger a 415 error instantly to throw the player down into binary strategy mode.
+            if (!forceBinary && streamUrl.toLowerCase().includes('.m3u8')) {
+              res.status(415).send('Fake M3U8 intercepted.');
               return;
             }
 
