@@ -162,7 +162,7 @@ async function startServer() {
             return followRedirect(location, depth + 1);
           }
 
-          // FIX: Look at the current resolved final destination url and headers, NOT the initial input query
+          // Evaluate the current resolved final destination url and headers, NOT the initial input query
           const finalUrlLower = url.toLowerCase();
           const contentTypeLower = (proxyRes.headers['content-type'] || '').toLowerCase();
 
@@ -223,7 +223,14 @@ async function startServer() {
               res.end(rewritten);
             });
           } else {
-            // Safe Pipeline: If it's a raw video chunk stream post-redirect, pipe the binary chunks immediately
+            // CRITICAL FAIL-FAST CHECK: If the client asked for a playlist (.m3u8) but 
+            // the server redirected us to an infinite raw video stream, send a 415 error code.
+            // This crashes hls.js instantly, triggering the frontend to hop cleanly onto the mpegts player fallback.
+            if (streamUrl.toLowerCase().includes('.m3u8')) {
+              res.status(415).send('Expected M3U8 text manifest but received binary stream. Forcing player fallback sequence.');
+              return;
+            }
+
             res.writeHead(proxyRes.statusCode || 200, headersToForward);
             proxyRes.pipe(res);
           }
