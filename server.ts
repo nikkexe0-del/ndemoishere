@@ -162,9 +162,13 @@ async function startServer() {
             return followRedirect(location, depth + 1);
           }
 
-          // Check if the response is an M3U8 playlist
-          const isM3u8 = streamUrl.toLowerCase().includes('.m3u8') || 
-                        (proxyRes.headers['content-type'] && proxyRes.headers['content-type'].toLowerCase().includes('mpegurl'));
+          // FIX: Look at the current resolved final destination url and headers, NOT the initial input query
+          const finalUrlLower = url.toLowerCase();
+          const contentTypeLower = (proxyRes.headers['content-type'] || '').toLowerCase();
+
+          const isM3u8 = finalUrlLower.includes('.m3u8') || 
+                        contentTypeLower.includes('mpegurl') ||
+                        contentTypeLower.includes('x-mpegurl');
 
           // Forward headers
           const headersToForward: Record<string, string | string[]> = {};
@@ -175,7 +179,7 @@ async function startServer() {
           }
           headersToForward['access-control-allow-origin'] = '*';
           if (!headersToForward['content-type']) {
-              headersToForward['content-type'] = 'video/mp2t';
+              headersToForward['content-type'] = isM3u8 ? 'application/x-mpegURL' : 'video/mp2t';
           }
 
           if (isM3u8) {
@@ -219,6 +223,7 @@ async function startServer() {
               res.end(rewritten);
             });
           } else {
+            // Safe Pipeline: If it's a raw video chunk stream post-redirect, pipe the binary chunks immediately
             res.writeHead(proxyRes.statusCode || 200, headersToForward);
             proxyRes.pipe(res);
           }
