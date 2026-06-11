@@ -15,19 +15,11 @@ interface VideoPlayerProps {
 
 type StreamKind = 'hls' | 'mpegts' | 'native';
 
-function detectKind(url: string): StreamKind {
-  const lowercaseUrl = url.toLowerCase();
-  if (lowercaseUrl.includes('.m3u8')) return 'hls';
-  if (
-    lowercaseUrl.includes('.ts') ||
-    lowercaseUrl.includes('.mpegts') ||
-    lowercaseUrl.includes('.m2ts') ||
-    lowercaseUrl.includes('.flv') ||
-    (lowercaseUrl.includes('/live/') && !lowercaseUrl.includes('.m3u8')) // Xtream API typical stream URL
-  ) {
-    return 'mpegts';
-  }
-  return 'native'; // Default to native for mp4, mkv, webm, avi, etc
+interface LoadAttempt {
+  url: string;
+  forceKind: StreamKind;
+  disableAudio: boolean;
+  label: string;
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlaybackFailed, onNext, onPrev, hasNext, hasPrev }) => {
@@ -135,6 +127,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
     let active = true;
     let currentMpegtsPlayer: mpegts.Player | null = null;
     let currentHls: Hls | null = null;
+    let watchdogTimeout: NodeJS.Timeout | null = null;
 
     // Reset state
     setError(null);
@@ -142,88 +135,128 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
     setLoading(true);
     setBuffering(false);
 
-    const kind = detectKind(url);
-    const proxiedUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+    // Build absolute tank-proof cascade list of streaming strategies
+    const attempts: LoadAttempt[] = [];
+    const proxiedOriginalUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
 
-    // FIX: Generate fallback TS variants accurately by maintaining the /live/ routing block
-    let fallbackTsUrl = "";
-    if (url.includes('/live/') && url.includes('.m3u8')) {
-      fallbackTsUrl = url.replace('.m3u8', '');
+    // 1. Try default layout (HLS proxy)
+    attempts.push({ 
+      url: proxiedOriginalUrl, 
+      forceKind: 'hls', 
+      disableAudio: false, 
+      label: 'HLS Live Proxy Link' 
+    });
+
+    // Extract paths for TS fallbacks if dealing with an m3u8 playlist wrapper
+    if (url.toLowerCase().includes('.m3u8')) {
+      const tsUrl = url.replace(/\.m3u8/i, '.ts');
+      const cleanUrl = url.replace(/\.m3u8/i, '');
+
+      // 2. Try raw .ts route via proxy with Audio
+      attempts.push({ 
+        url: `/api/proxy?url=${encodeURIComponent(tsUrl)}`, 
+        forceKind: 'mpegts', 
+        disableAudio: false, 
+        label: 'MPEG-TS Standard Stream' 
+      });
+
+      // 3. Try raw .ts route via proxy WITHOUT Audio (Bypasses corrupted panels syncing freeze loops)
+      attempts.push({ 
+        url: `/api/proxy?url=${encodeURIComponent(tsUrl)}`, 
+        forceKind: 'mpegts', 
+        disableAudio: true, 
+        label: 'MPEG-TS Video Only Bypass Mode' 
+      });
+
+      // 4. Try extensionless directory structure with Audio
+      attempts.push({ 
+        url: `/api/proxy?url=${encodeURIComponent(cleanUrl)}`, 
+        forceKind: 'mpegts', 
+        disableAudio: false, 
+        label: 'Direct Panel Routing Stream' 
+      });
+      
+      // 5. Try extensionless directory structure WITHOUT Audio
+      attempts.push({ 
+        url: `/api/proxy?url=${encodeURIComponent(cleanUrl)}`, 
+        forceKind: 'mpegts', 
+        disableAudio: true, 
+        label: 'Direct Panel Video Only Bypass Mode' 
+      });
     }
 
-    type LoadAttempt = {
-      url: string;
-      disableAudio?: boolean;
-      forceKind?: StreamKind;
-    };
-    
-    const buildAttemptsList = (targetUrl: string, targetKind: StreamKind) => {
-      const targetProxiedUrl = `/api/proxy?url=${encodeURIComponent(targetUrl)}`;
-      const result: LoadAttempt[] = [];
-      if (targetUrl.startsWith('https://')) {
-        result.push({ url: targetUrl, forceKind: targetKind });
-        result.push({ url: targetProxiedUrl, forceKind: targetKind });
-      } else {
-        result.push({ url: targetProxiedUrl, forceKind: targetKind });
-        result.push({ url: targetUrl, forceKind: targetKind });
+    const clearWatchdog = () => {
+      if (watchdogTimeout) {
+        clearTimeout(watchdogTimeout);
+        watchdogTimeout = null;
       }
-      return result;
     };
-
-    let attempts: LoadAttempt[] = buildAttemptsList(url, kind);
-    
-    // If we're a live stream trying HLS, fallback to TS stream on failure
-    if (fallbackTsUrl) {
-      attempts.push(...buildAttemptsList(fallbackTsUrl, 'mpegts'));
-    }
 
     const tryLoad = (attemptIndex: number) => {
       if (!active) return;
+      clearWatchdog();
 
       if (attemptIndex >= attempts.length) {
-        setError(`Failed to play stream after exhausting connection attempts.`);
+        setError(`This stream could not be loaded. This happens when the source broadcaster channel is down or offline.`);
         setLoading(false);
+        setBuffering(false);
         if (onPlaybackFailed) onPlaybackFailed();
         return;
       }
 
       const activeAttempt = attempts[attemptIndex];
       const activeUrl = activeAttempt.url;
-      const activeKind = activeAttempt.forceKind || kind;
+      const activeKind = activeAttempt.forceKind;
       
-      const logMsg = `Attempt ${attemptIndex + 1}/${attempts.length}: Loading ${activeKind} stream`;
-      console.log(`VideoPlayer: ${logMsg} with URL: ${activeUrl} (audio: ${!activeAttempt.disableAudio})`);
+      const logMsg = `[Strategy ${attemptIndex + 1}/${attempts.length}] Initializing ${activeAttempt.label}`;
+      console.log(`VideoPlayer: ${logMsg}`);
       setErrorLogs(prev => [...prev, logMsg]);
 
-      // Clean up previous attempts
+      // Complete cleanup of active player libraries
       if (currentMpegtsPlayer) {
         try {
           currentMpegtsPlayer.unload();
           currentMpegtsPlayer.detachMediaElement();
           currentMpegtsPlayer.destroy();
-        } catch (e) {
-          console.warn('Error cleaning up previous mpegts player:', e);
-        }
+        } catch (e) {}
         currentMpegtsPlayer = null;
         playerRef.current = null;
       }
       if (currentHls) {
         try {
           currentHls.destroy();
-        } catch (e) {
-          console.warn('Error cleaning up previous HLS player:', e);
-        }
+        } catch (e) {}
         currentHls = null;
         hlsRef.current = null;
       }
 
+      // CRITICAL FLUSH: Explicitly strip, pause, and completely reset browser media state strings
+      try {
+        video.pause();
+        video.src = '';
+        video.removeAttribute('src');
+        video.load();
+      } catch (e) {}
+
+      setLoading(true);
+      setBuffering(false);
+
+      // ARM WATCHDOG TIMER: If video fails to output frames within 6 seconds, force-advance state loop
+      watchdogTimeout = setTimeout(() => {
+        if (!active) return;
+        console.warn(`Watchdog triggered: Strategy ${attemptIndex + 1} stalled on buffering. Advancing to next strategy...`);
+        setErrorLogs(prev => [...prev, `⚠️ Strategy ${attemptIndex + 1} connection timed out`]);
+        tryLoad(attemptIndex + 1);
+      }, 6000);
+
       if (activeKind === 'hls') {
         if (Hls.isSupported()) {
           const hls = new Hls({
-            enableWorker: false, // Disabling worker ensures iframe sandbox compatibility
+            enableWorker: false,
             lowLatencyMode: false,
-            manifestLoadingMaxRetry: 2,
-            levelLoadingMaxRetry: 2,
+            manifestLoadingMaxRetry: 1,
+            levelLoadingMaxRetry: 1,
+            fragLoadingMaxRetry: 1
           });
           currentHls = hls;
           hlsRef.current = hls;
@@ -234,131 +267,101 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (!active) return;
             video.play().catch(() => {});
-            setLoading(false);
           });
 
           hls.on(Hls.Events.ERROR, (_, data) => {
             if (!active) return;
             if (data.fatal) {
-              const errMsg = `HLS Error: ${data.type} (${data.details})`;
-              console.warn(`HLS fatal error: ${data.type} (details: ${data.details}), trying next fallback...`);
-              setErrorLogs(prev => [...prev, errMsg]);
-              setTimeout(() => tryLoad(attemptIndex + 1), 10);
+              clearWatchdog();
+              setTimeout(() => tryLoad(attemptIndex + 1), 20);
             }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          // Native Safari HLS support
           video.src = activeUrl;
           
           const onLoadedMetadata = () => {
             if (!active) return;
             video.play().catch(() => {});
-            setLoading(false);
           };
 
           const onNativeError = () => {
             if (!active) return;
-            const errMsg = `Native HLS playback error on attempt ${attemptIndex + 1}`;
-            console.warn(`${errMsg}, trying next fallback...`);
-            setErrorLogs(prev => [...prev, errMsg]);
+            clearWatchdog();
             video.removeEventListener('loadedmetadata', onLoadedMetadata);
             video.removeEventListener('error', onNativeError);
-            setTimeout(() => tryLoad(attemptIndex + 1), 10);
+            setTimeout(() => tryLoad(attemptIndex + 1), 20);
           };
 
           video.addEventListener('loadedmetadata', onLoadedMetadata);
           video.addEventListener('error', onNativeError);
         } else {
-          setErrorLogs(prev => [...prev, 'HLS is not supported in this browser.']);
-          setError('HLS is not supported in this browser.');
-          setLoading(false);
-          if (onPlaybackFailed) onPlaybackFailed();
+          clearWatchdog();
+          tryLoad(attemptIndex + 1);
         }
       } else if (activeKind === 'mpegts') {
         if (mpegts.getFeatureList().mseLivePlayback) {
           try {
             const player = mpegts.createPlayer({
-              type: url.toLowerCase().includes('.flv') ? 'flv' : 'mpegts',
+              type: 'mpegts',
               isLive: true,
               url: activeUrl,
               hasAudio: !activeAttempt.disableAudio,
             }, {
-              enableWorker: false, // Disabling worker is essential inside sandbox iframes
+              enableWorker: false,
               lazyLoad: false,
-              liveBufferLatencyChasing: false,
-              stashInitialSize: 128,
+              liveBufferLatencyChasing: true,
+              liveBufferLatencyMaxLatency: 2.5,
+              liveBufferLatencyMinRemaining: 0.8,
+              stashInitialSize: 32, // Tiny buffer size ensures ultra fast startup times
             });
+            
             currentMpegtsPlayer = player;
             playerRef.current = player;
             player.attachMediaElement(video);
             player.load();
             
-            const playPromise = player.play() as any;
-            if (playPromise && playPromise.catch) {
-              playPromise.catch(() => {});
-            }
-            setLoading(false);
+            player.play().catch(() => {});
             
-            player.on(mpegts.Events.ERROR, (type, detail) => {
+            player.on(mpegts.Events.ERROR, () => {
               if (!active) return;
-              const errMsg = `MPEG-TS Player Error: type=${type}, detail=${detail}`;
-              console.warn(`${errMsg} on attempt ${attemptIndex + 1}. Trying next fallback...`);
-              setErrorLogs(prev => [...prev, errMsg]);
-              setTimeout(() => tryLoad(attemptIndex + 1), 10);
+              clearWatchdog();
+              setTimeout(() => tryLoad(attemptIndex + 1), 20);
             });
-          } catch (err: any) {
-            console.error('Failed to create MPEG-TS player:', err);
-            setErrorLogs(prev => [...prev, `Failed to create MPEG-TS player: ${err.message || 'Unknown'}`]);
+          } catch (err) {
+            clearWatchdog();
             tryLoad(attemptIndex + 1);
           }
         } else {
-          setErrorLogs(prev => [...prev, 'MPEG-TS/FLV playback is not supported in this browser.']);
-          setError('MPEG-TS/FLV playback is not supported in this browser.');
-          setLoading(false);
-          if (onPlaybackFailed) onPlaybackFailed();
+          clearWatchdog();
+          tryLoad(attemptIndex + 1);
         }
-      } else {
-        // Native
-        video.src = activeUrl;
-
-        const onLoaded = () => {
-          if (!active) return;
-          video.play().catch(() => {});
-          setLoading(false);
-        };
-
-        const onNativeError = () => {
-          if (!active) return;
-          const errMsg = `Native playback error on attempt ${attemptIndex + 1}`;
-          console.warn(`${errMsg}. Trying next fallback...`);
-          setErrorLogs(prev => [...prev, errMsg]);
-          video.removeEventListener('loadedmetadata', onLoaded);
-          video.removeEventListener('error', onNativeError);
-          setTimeout(() => tryLoad(attemptIndex + 1), 10);
-        };
-
-        video.addEventListener('loadedmetadata', onLoaded);
-        video.addEventListener('error', onNativeError);
       }
     };
 
-    // Begin Loading
+    // Initialize pipeline cascade
     tryLoad(0);
 
-    const handleWaiting = () => setBuffering(true);
-    const handlePlaying = () => setBuffering(false);
+    const handleWaiting = () => {
+      if (active) setBuffering(true);
+    };
+    
+    const handlePlaying = () => {
+      if (!active) return;
+      clearWatchdog(); // Kill watchdog loop completely once video outputs active frames
+      setBuffering(false);
+      setLoading(false);
+    };
 
     video.addEventListener('waiting', handleWaiting);
     video.addEventListener('playing', handlePlaying);
 
     return () => {
       active = false;
+      clearWatchdog();
       video.removeEventListener('waiting', handleWaiting);
       video.removeEventListener('playing', handlePlaying);
       if (currentHls) {
-        try {
-          currentHls.destroy();
-        } catch (e) {}
+        try { currentHls.destroy(); } catch (e) {}
       }
       if (currentMpegtsPlayer) {
         try {
@@ -367,12 +370,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
           currentMpegtsPlayer.destroy();
         } catch (e) {}
       }
-      if (video) {
-        try {
-          video.src = '';
-          video.load();
-        } catch (e) {}
-      }
+      try {
+        video.src = '';
+        video.load();
+      } catch (e) {}
     };
   }, [url, onPlaybackFailed]);
 
@@ -386,22 +387,22 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
     >
       {(loading || buffering) && !error && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black">
-          <div className="text-4xl md:text-7xl font-black italic tracking-tighter text-white shimmer-text animate-pulse">
+          <div className="text-4xl md:text-7xl font-black italic tracking-tighter text-white shimmer-text animate-pulse select-none">
             ZESTYYSPORTS
           </div>
         </div>
       )}
 
       {error ? (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#1a1313] z-50 p-6 text-center">
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#140e0e] z-50 p-6 text-center select-none">
           <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
-          <h3 className="text-white font-semibold text-lg mb-2">Playback Error</h3>
-          <p className="text-red-400/80 text-sm max-w-md mb-3">{error}</p>
+          <h3 className="text-white font-bold text-lg mb-2 uppercase tracking-wide">Channel Offline</h3>
+          <p className="text-gray-400 text-xs max-w-sm mb-4 leading-relaxed">{error}</p>
           
           {errorLogs.length > 0 && (
-            <div className="bg-black/50 border border-red-500/20 text-xs text-red-300 p-2.5 rounded max-w-md w-full max-h-32 overflow-y-auto text-left space-y-1 mb-4 font-mono custom-scrollbar">
+            <div className="bg-black/60 border border-white/5 text-[10px] text-gray-500 p-3 rounded-lg max-w-sm w-full max-h-24 overflow-y-auto text-left space-y-1 mb-4 font-mono custom-scrollbar">
               {errorLogs.map((log, i) => (
-                <div key={i}>{log}</div>
+                <div key={i} className="truncate">{log}</div>
               ))}
             </div>
           )}
@@ -410,25 +411,25 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
              {hasPrev && (
                <button 
                  onClick={onPrev}
-                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-sm border border-slate-600 transition-colors flex items-center gap-2"
+                 className="px-4 py-2 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 rounded-lg text-xs font-semibold border border-zinc-800 transition-colors flex items-center gap-2"
                >
-                 <SkipBack className="w-4 h-4" />
+                 <SkipBack className="w-3.5 h-3.5" />
                  Prev
                </button>
              )}
              <button 
                onClick={() => window.location.reload()}
-               className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg text-sm border border-red-500/30 transition-colors"
+               className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg text-xs tracking-wider uppercase transition-colors"
              >
-               Refresh Player
+               Retry Connection
              </button>
              {hasNext && (
                <button 
                  onClick={onNext}
-                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-sm border border-slate-600 transition-colors flex items-center gap-2"
+                 className="px-4 py-2 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 rounded-lg text-xs font-semibold border border-zinc-800 transition-colors flex items-center gap-2"
                >
                  Next
-                 <SkipForward className="w-4 h-4" />
+                 <SkipForward className="w-3.5 h-3.5" />
                </button>
              )}
           </div>
@@ -452,7 +453,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
             zestyysports
           </div>
 
-          {/* Top Left Live Badge */}
           <div className={`absolute top-3 left-3 sm:top-4 sm:left-4 z-40 transition-opacity duration-300 ${showControls || !isPlaying ? 'opacity-100' : 'opacity-0'}`}>
              <div className="px-2.5 py-1 bg-red-600/90 backdrop-blur-md rounded border border-red-500/40 flex items-center gap-1.5 shadow-lg shadow-red-600/20">
                 <div className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
@@ -460,7 +460,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ url, title, onPlayback
              </div>
           </div>
 
-          {/* Bottom Controls Gradient & Bar */}
           <div className={`absolute bottom-0 left-0 right-0 z-40 transition-opacity duration-500 bg-gradient-to-t from-black/95 via-black/50 to-transparent pt-20 px-3 pb-3 sm:px-4 sm:pb-4 ${showControls || !isPlaying ? 'opacity-100' : 'opacity-0'}`}>
             <div className="flex flex-col gap-2">
               <div className="flex justify-between items-center text-white w-full gap-2 sm:gap-4">
